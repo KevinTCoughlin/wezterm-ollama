@@ -83,12 +83,16 @@ end
 
 local function parse_model_info(str)
   local models = {}
-  -- Parse each model entry from /api/tags
-  for block in str:gmatch('{[^{}]*"name"%s*:%s*"[^"]+"[^{}]*}') do
-    local name = block:match('"name"%s*:%s*"([^"]+)"')
-    local size = block:match('"size"%s*:%s*(%d+)')
-    local params = block:match('"parameter_size"%s*:%s*"([^"]+)"')
-    if name then
+  local seen = {}
+  -- Simple approach: find all "name":"value" patterns, filter to model names
+  for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
+    -- Skip if we've seen this name (avoid duplicates from "model" field)
+    if not seen[name] then
+      seen[name] = true
+      -- Find corresponding size
+      local size = str:match('"name"%s*:%s*"' .. name:gsub("([%.%-%+])", "%%%1") .. '".-"size"%s*:%s*(%d+)')
+      -- Find parameter_size in details
+      local params = str:match('"name"%s*:%s*"' .. name:gsub("([%.%-%+])", "%%%1") .. '".-"parameter_size"%s*:%s*"([^"]+)"')
       table.insert(models, {
         name = name,
         size = size and tonumber(size) or 0,
@@ -258,7 +262,7 @@ local function format_size(bytes)
   return string.format("%.0fMB", mb)
 end
 
-local function create_model_selector_action(opts)
+local function create_model_selector_action_internal(opts)
   return wezterm.action_callback(function(window, pane)
     local models = fetch_models(opts)
 
@@ -296,7 +300,7 @@ local function create_model_selector_action(opts)
           if id then
             inner_window:perform_action(
               wezterm.action.SpawnCommandInNewTab({
-                args = { "ollama", "run", id },
+                args = { "/opt/homebrew/bin/ollama", "run", id },
                 set_environment_variables = { OLLAMA_MODEL = id },
               }),
               inner_pane
@@ -309,11 +313,22 @@ local function create_model_selector_action(opts)
   end)
 end
 
-local function create_quick_chat_action(opts)
+local function create_quick_chat_action_internal(opts)
   return wezterm.action.SpawnCommandInNewTab({
-    args = { "ollama", "run", opts.default_model },
+    args = { "/opt/homebrew/bin/ollama", "run", opts.default_model },
     set_environment_variables = { OLLAMA_MODEL = opts.default_model },
   })
+end
+
+-- Public action creators
+function M.create_model_selector_action(opts)
+  opts = opts or resolved_opts or defaults
+  return create_model_selector_action_internal(opts)
+end
+
+function M.create_quick_chat_action(opts)
+  opts = opts or resolved_opts or defaults
+  return create_quick_chat_action_internal(opts)
 end
 
 -- ============================================
@@ -378,7 +393,7 @@ local function create_session_picker_action(opts)
             if model then
               inner_window:perform_action(
                 wezterm.action.SpawnCommandInNewTab({
-                  args = { "ollama", "run", model },
+                  args = { "/opt/homebrew/bin/ollama", "run", model },
                   set_environment_variables = { OLLAMA_MODEL = model },
                 }),
                 inner_pane
@@ -410,14 +425,14 @@ function M.apply_to_config(config, user_opts)
   table.insert(config.keys, {
     key = opts.keys.select_model,
     mods = "LEADER",
-    action = create_model_selector_action(opts),
+    action = create_model_selector_action_internal(opts),
   })
 
   -- Quick chat (LEADER + o)
   table.insert(config.keys, {
     key = opts.keys.quick_chat,
     mods = "LEADER",
-    action = create_quick_chat_action(opts),
+    action = create_quick_chat_action_internal(opts),
   })
 
   -- Session picker (LEADER + O) - only if sessions enabled
