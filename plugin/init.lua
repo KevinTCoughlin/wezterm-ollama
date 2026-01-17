@@ -9,7 +9,7 @@ local M = {}
 -- ============================================
 
 local defaults = {
-  host = "http://localhost:11434",
+  host = "http://127.0.0.1:11434",
   update_interval = 2000,
   cache_ttl = 30,
   default_model = "llama3.2",
@@ -105,9 +105,11 @@ end
 
 local function parse_running_models(str)
   local models = {}
-  for block in str:gmatch('{[^{}]*"name"%s*:%s*"[^"]+"[^{}]*}') do
-    local name = block:match('"name"%s*:%s*"([^"]+)"')
-    if name then
+  local seen = {}
+  -- Find model names in /api/ps response (handles nested JSON)
+  for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
+    if not seen[name] then
+      seen[name] = true
       table.insert(models, name)
     end
   end
