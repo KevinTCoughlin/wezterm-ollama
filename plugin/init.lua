@@ -207,7 +207,7 @@ function M.get_status_elements(opts)
 
   -- Ollama icon
   table.insert(elements, { Foreground = { Color = opts.colors.model } })
-  table.insert(elements, { Text = "󰳆 " })
+  table.insert(elements, { Text = "🔨 " })
 
   if status == "running" then
     -- Running indicator (green dot)
@@ -294,7 +294,7 @@ local function create_model_selector_action_internal(opts)
 
     window:perform_action(
       wezterm.action.InputSelector({
-        title = "󰳆 Select Ollama Model",
+        title = "🔨 Select Ollama Model",
         description = "Choose a model to run",
         choices = choices,
         fuzzy = true,
@@ -384,7 +384,7 @@ local function create_session_picker_action(opts)
 
     window:perform_action(
       wezterm.action.InputSelector({
-        title = "󰳆 Resume Ollama Session",
+        title = "🔨 Resume Ollama Session",
         description = "Choose a session to resume",
         choices = choices,
         fuzzy = true,
