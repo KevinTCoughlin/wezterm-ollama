@@ -1,34 +1,86 @@
--- Wezterm Ollama Plugin
--- Model selection, chat sessions, and status bar integration
+-- wezterm-ollama: Ollama integration for Wezterm
+-- https://github.com/KevinTCoughlin/wezterm-ollama
+--
+-- Features:
+--   - Model selector with InputSelector
+--   - Status bar integration (server status, loaded model)
+--   - Quick chat keybinding
+--   - Smart datetime display
+
 local wezterm = require("wezterm")
 
 local M = {}
+
+-- ============================================
+-- Plugin Metadata
+-- ============================================
+
+M._VERSION = "1.0.0"
+M._LICENSE = "MIT"
+M._URL = "https://github.com/KevinTCoughlin/wezterm-ollama"
+
+-- ============================================
+-- Platform Detection & Paths
+-- ============================================
+
+local function detect_ollama_path()
+  -- Check common installation paths
+  local paths = {
+    "/opt/homebrew/bin/ollama",  -- macOS Homebrew (Apple Silicon)
+    "/usr/local/bin/ollama",     -- macOS Homebrew (Intel) / Linux
+    "/usr/bin/ollama",           -- Linux package manager
+  }
+  for _, path in ipairs(paths) do
+    local f = io.open(path, "r")
+    if f then
+      f:close()
+      return path
+    end
+  end
+  -- Fallback to PATH lookup
+  return "ollama"
+end
 
 -- ============================================
 -- Configuration Defaults
 -- ============================================
 
 local defaults = {
+  -- Ollama API settings
   host = "http://127.0.0.1:11434",
-  update_interval = 2000,
-  cache_ttl = 30,
-  default_model = "llama3.2",
+  ollama_path = nil,  -- Auto-detected if nil
+
+  -- Status bar
+  update_interval = 2000,  -- ms between status checks
+  cache_ttl = 30,          -- seconds to cache model list
+
+  -- Default model for quick chat (nil = first available)
+  default_model = nil,
+
+  -- Feature flags
   show_status = true,
   save_sessions = false,
-  sessions_dir = os.getenv("HOME") .. "/.ollama/sessions",
+  sessions_dir = (os.getenv("HOME") or "") .. "/.ollama/sessions",
+
+  -- Keybindings (set to false to disable)
   keys = {
-    select_model = "i",
-    quick_chat = "o",
-    resume_session = "O",
+    select_model = "i",      -- LEADER + key
+    quick_chat = "o",        -- LEADER + key
+    resume_session = "O",    -- LEADER + SHIFT + key
   },
+
+  -- Status bar colors (Tokyo Night defaults)
   colors = {
-    running = "#9ece6a",
-    stopped = "#f7768e",
-    model = "#7aa2f7",
-    loading = "#e0af68",
-    separator = "#565f89",
-    datetime = "#565f89",
+    running = "#9ece6a",     -- Green
+    stopped = "#f7768e",     -- Red
+    model = "#7aa2f7",       -- Blue
+    loading = "#e0af68",     -- Orange
+    separator = "#565f89",   -- Gray
+    datetime = "#565f89",    -- Gray
   },
+
+  -- Status bar icon
+  icon = "🔨",
 }
 
 -- ============================================
@@ -41,58 +93,56 @@ local state = {
   server_status = "unknown",
   loaded_model = nil,
   last_check = 0,
+  ollama_path = nil,
 }
 
--- Merge user options with defaults
+-- Deep merge user options with defaults
 local function merge_opts(user_opts)
+  user_opts = user_opts or {}
   local opts = {}
+
   for k, v in pairs(defaults) do
     if type(v) == "table" then
       opts[k] = {}
       for tk, tv in pairs(v) do
         opts[k][tk] = tv
       end
-      if user_opts and user_opts[k] then
+      if user_opts[k] and type(user_opts[k]) == "table" then
         for tk, tv in pairs(user_opts[k]) do
           opts[k][tk] = tv
         end
       end
     else
-      opts[k] = user_opts and user_opts[k] ~= nil and user_opts[k] or v
+      opts[k] = user_opts[k] ~= nil and user_opts[k] or v
     end
   end
+
+  -- Auto-detect ollama path if not specified
+  if not opts.ollama_path then
+    opts.ollama_path = detect_ollama_path()
+  end
+  state.ollama_path = opts.ollama_path
+
   return opts
 end
 
--- Store resolved options
+-- Resolved options (set after apply_to_config)
 local resolved_opts = nil
 
 -- ============================================
--- API Helpers
+-- JSON Parsing Helpers
 -- ============================================
-
--- Parse JSON (simple parser for Ollama API responses)
-local function parse_json_array(str, key)
-  local items = {}
-  -- Match array items for models list
-  for item in str:gmatch('"' .. key .. '"%s*:%s*"([^"]+)"') do
-    table.insert(items, item)
-  end
-  return items
-end
 
 local function parse_model_info(str)
   local models = {}
   local seen = {}
-  -- Simple approach: find all "name":"value" patterns, filter to model names
+
   for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
-    -- Skip if we've seen this name (avoid duplicates from "model" field)
     if not seen[name] then
       seen[name] = true
-      -- Find corresponding size
-      local size = str:match('"name"%s*:%s*"' .. name:gsub("([%.%-%+])", "%%%1") .. '".-"size"%s*:%s*(%d+)')
-      -- Find parameter_size in details
-      local params = str:match('"name"%s*:%s*"' .. name:gsub("([%.%-%+])", "%%%1") .. '".-"parameter_size"%s*:%s*"([^"]+)"')
+      local escaped = name:gsub("([%.%-%+%:])", "%%%1")
+      local size = str:match('"name"%s*:%s*"' .. escaped .. '".-"size"%s*:%s*(%d+)')
+      local params = str:match('"name"%s*:%s*"' .. escaped .. '".-"parameter_size"%s*:%s*"([^"]+)"')
       table.insert(models, {
         name = name,
         size = size and tonumber(size) or 0,
@@ -106,7 +156,7 @@ end
 local function parse_running_models(str)
   local models = {}
   local seen = {}
-  -- Find model names in /api/ps response (handles nested JSON)
+
   for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
     if not seen[name] then
       seen[name] = true
@@ -116,7 +166,10 @@ local function parse_running_models(str)
   return models
 end
 
--- Fetch models from Ollama API
+-- ============================================
+-- Ollama API
+-- ============================================
+
 local function fetch_models(opts)
   local now = os.time()
   if now - state.models_updated < opts.cache_ttl and #state.models > 0 then
@@ -124,9 +177,7 @@ local function fetch_models(opts)
   end
 
   local success, output = wezterm.run_child_process({
-    "curl",
-    "-s",
-    "--connect-timeout", "2",
+    "curl", "-s", "--connect-timeout", "2",
     opts.host .. "/api/tags",
   })
 
@@ -141,18 +192,14 @@ local function fetch_models(opts)
   return state.models
 end
 
--- Check Ollama server status and loaded model
 local function check_server_status(opts)
   local now = os.time()
   if now - state.last_check < 2 then
     return state.server_status, state.loaded_model
   end
 
-  -- Check /api/ps for running models
   local success, output = wezterm.run_child_process({
-    "curl",
-    "-s",
-    "--connect-timeout", "1",
+    "curl", "-s", "--connect-timeout", "1",
     opts.host .. "/api/ps",
   })
 
@@ -166,7 +213,7 @@ local function check_server_status(opts)
 
   state.server_status = "running"
   local running = parse_running_models(output)
-  state.loaded_model = running[1] -- First loaded model, if any
+  state.loaded_model = running[1]
 
   return state.server_status, state.loaded_model
 end
@@ -176,47 +223,32 @@ end
 -- ============================================
 
 local function smart_datetime()
-  local now = os.time()
-  local date = os.date("*t", now)
-
-  -- 12-hour format
+  local date = os.date("*t")
   local hour = date.hour % 12
-  if hour == 0 then
-    hour = 12
-  end
+  if hour == 0 then hour = 12 end
   local ampm = date.hour < 12 and "a" or "p"
-  local time = string.format("%d:%02d%s", hour, date.min, ampm)
-
-  -- Weekday for context
   local weekdays = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
-  local wday = weekdays[date.wday]
-
-  return wday .. " " .. time
+  return string.format("%s %d:%02d%s", weekdays[date.wday], hour, date.min, ampm)
 end
 
 -- ============================================
 -- Status Bar Elements
 -- ============================================
 
--- Get Ollama status elements for status bar
 function M.get_status_elements(opts)
   opts = opts or resolved_opts or defaults
   local elements = {}
-
   local status, model = check_server_status(opts)
 
-  -- Ollama icon
+  -- Icon
   table.insert(elements, { Foreground = { Color = opts.colors.model } })
-  table.insert(elements, { Text = "🔨 " })
+  table.insert(elements, { Text = opts.icon .. " " })
 
   if status == "running" then
-    -- Running indicator (green dot)
     table.insert(elements, { Foreground = { Color = opts.colors.running } })
     table.insert(elements, { Text = "● " })
 
-    -- Model name or "idle"
     if model then
-      -- Strip tag suffix if present (e.g., "llama3.2:latest" -> "llama3.2")
       local display_name = model:match("^([^:]+)") or model
       table.insert(elements, { Foreground = { Color = opts.colors.model } })
       table.insert(elements, { Text = display_name })
@@ -225,11 +257,9 @@ function M.get_status_elements(opts)
       table.insert(elements, { Text = "idle" })
     end
   elseif status == "loading" then
-    -- Loading indicator (orange)
     table.insert(elements, { Foreground = { Color = opts.colors.loading } })
     table.insert(elements, { Text = "◐ loading" })
   else
-    -- Stopped indicator (red)
     table.insert(elements, { Foreground = { Color = opts.colors.stopped } })
     table.insert(elements, { Text = "○ off" })
   end
@@ -237,7 +267,6 @@ function M.get_status_elements(opts)
   return elements
 end
 
--- Get smart datetime elements for status bar
 function M.get_datetime_elements(opts)
   opts = opts or resolved_opts or defaults
   return {
@@ -249,19 +278,14 @@ function M.get_datetime_elements(opts)
 end
 
 -- ============================================
--- Model Selector (InputSelector)
+-- Actions
 -- ============================================
 
 local function format_size(bytes)
-  if not bytes or bytes == 0 then
-    return ""
-  end
+  if not bytes or bytes == 0 then return "" end
   local gb = bytes / (1024 * 1024 * 1024)
-  if gb >= 1 then
-    return string.format("%.1fGB", gb)
-  end
-  local mb = bytes / (1024 * 1024)
-  return string.format("%.0fMB", mb)
+  if gb >= 1 then return string.format("%.1fGB", gb) end
+  return string.format("%.0fMB", bytes / (1024 * 1024))
 end
 
 local function create_model_selector_action_internal(opts)
@@ -277,32 +301,23 @@ local function create_model_selector_action_internal(opts)
     for _, model in ipairs(models) do
       local label = model.name
       local details = {}
-      if model.params and model.params ~= "" then
-        table.insert(details, model.params)
-      end
-      if model.size > 0 then
-        table.insert(details, format_size(model.size))
-      end
-      if #details > 0 then
-        label = label .. " (" .. table.concat(details, ", ") .. ")"
-      end
-      table.insert(choices, {
-        id = model.name,
-        label = label,
-      })
+      if model.params ~= "" then table.insert(details, model.params) end
+      if model.size > 0 then table.insert(details, format_size(model.size)) end
+      if #details > 0 then label = label .. " (" .. table.concat(details, ", ") .. ")" end
+      table.insert(choices, { id = model.name, label = label })
     end
 
     window:perform_action(
       wezterm.action.InputSelector({
-        title = "🔨 Select Ollama Model",
+        title = opts.icon .. " Select Ollama Model",
         description = "Choose a model to run",
         choices = choices,
         fuzzy = true,
-        action = wezterm.action_callback(function(inner_window, inner_pane, id, label)
+        action = wezterm.action_callback(function(inner_window, inner_pane, id)
           if id then
             inner_window:perform_action(
               wezterm.action.SpawnCommandInNewTab({
-                args = { "/opt/homebrew/bin/ollama", "run", id },
+                args = { opts.ollama_path, "run", id },
                 set_environment_variables = { OLLAMA_MODEL = id },
               }),
               inner_pane
@@ -316,58 +331,35 @@ local function create_model_selector_action_internal(opts)
 end
 
 local function create_quick_chat_action_internal(opts)
+  -- If no default model, use model selector instead
+  if not opts.default_model then
+    return create_model_selector_action_internal(opts)
+  end
+
   return wezterm.action.SpawnCommandInNewTab({
-    args = { "/opt/homebrew/bin/ollama", "run", opts.default_model },
+    args = { opts.ollama_path, "run", opts.default_model },
     set_environment_variables = { OLLAMA_MODEL = opts.default_model },
   })
 end
 
--- Public action creators
-function M.create_model_selector_action(opts)
-  opts = opts or resolved_opts or defaults
-  return create_model_selector_action_internal(opts)
-end
-
-function M.create_quick_chat_action(opts)
-  opts = opts or resolved_opts or defaults
-  return create_quick_chat_action_internal(opts)
-end
-
--- ============================================
--- Session Persistence (Optional)
--- ============================================
-
-local function ensure_sessions_dir(opts)
-  if opts.save_sessions then
-    os.execute("mkdir -p " .. opts.sessions_dir)
-  end
-end
-
-local function list_sessions(opts)
-  local sessions = {}
-  if not opts.save_sessions then
-    return sessions
-  end
-
-  local handle = io.popen("ls -t " .. opts.sessions_dir .. "/*.json 2>/dev/null | head -20")
-  if handle then
-    for line in handle:lines() do
-      local filename = line:match("([^/]+)%.json$")
-      if filename then
-        table.insert(sessions, {
-          path = line,
-          name = filename,
-        })
-      end
-    end
-    handle:close()
-  end
-  return sessions
-end
-
-local function create_session_picker_action(opts)
+local function create_session_picker_action_internal(opts)
   return wezterm.action_callback(function(window, pane)
-    local sessions = list_sessions(opts)
+    if not opts.save_sessions then
+      window:toast_notification("Ollama", "Session persistence not enabled", nil, 3000)
+      return
+    end
+
+    local handle = io.popen("ls -t " .. opts.sessions_dir .. "/*.json 2>/dev/null | head -20")
+    local sessions = {}
+    if handle then
+      for line in handle:lines() do
+        local filename = line:match("([^/]+)%.json$")
+        if filename then
+          table.insert(sessions, { path = line, name = filename })
+        end
+      end
+      handle:close()
+    end
 
     if #sessions == 0 then
       window:toast_notification("Ollama", "No saved sessions found", nil, 3000)
@@ -376,26 +368,22 @@ local function create_session_picker_action(opts)
 
     local choices = {}
     for _, session in ipairs(sessions) do
-      table.insert(choices, {
-        id = session.path,
-        label = session.name,
-      })
+      table.insert(choices, { id = session.path, label = session.name })
     end
 
     window:perform_action(
       wezterm.action.InputSelector({
-        title = "🔨 Resume Ollama Session",
+        title = opts.icon .. " Resume Ollama Session",
         description = "Choose a session to resume",
         choices = choices,
         fuzzy = true,
         action = wezterm.action_callback(function(inner_window, inner_pane, id, label)
           if id then
-            -- For now, just open a new chat with the model from session name
             local model = label:match("^([^_]+)")
             if model then
               inner_window:perform_action(
                 wezterm.action.SpawnCommandInNewTab({
-                  args = { "/opt/homebrew/bin/ollama", "run", model },
+                  args = { opts.ollama_path, "run", model },
                   set_environment_variables = { OLLAMA_MODEL = model },
                 }),
                 inner_pane
@@ -409,6 +397,19 @@ local function create_session_picker_action(opts)
   end)
 end
 
+-- Public action creators (for custom keybindings)
+function M.create_model_selector_action(opts)
+  return create_model_selector_action_internal(opts or resolved_opts or defaults)
+end
+
+function M.create_quick_chat_action(opts)
+  return create_quick_chat_action_internal(opts or resolved_opts or defaults)
+end
+
+function M.create_session_picker_action(opts)
+  return create_session_picker_action_internal(opts or resolved_opts or defaults)
+end
+
 -- ============================================
 -- Main Entry Point
 -- ============================================
@@ -418,31 +419,34 @@ function M.apply_to_config(config, user_opts)
   resolved_opts = opts
 
   -- Ensure sessions directory exists if enabled
-  ensure_sessions_dir(opts)
+  if opts.save_sessions then
+    os.execute("mkdir -p " .. opts.sessions_dir)
+  end
 
-  -- Add keybindings
+  -- Add keybindings (if not disabled)
   config.keys = config.keys or {}
 
-  -- Model selector (LEADER + i)
-  table.insert(config.keys, {
-    key = opts.keys.select_model,
-    mods = "LEADER",
-    action = create_model_selector_action_internal(opts),
-  })
+  if opts.keys.select_model then
+    table.insert(config.keys, {
+      key = opts.keys.select_model,
+      mods = "LEADER",
+      action = create_model_selector_action_internal(opts),
+    })
+  end
 
-  -- Quick chat (LEADER + o)
-  table.insert(config.keys, {
-    key = opts.keys.quick_chat,
-    mods = "LEADER",
-    action = create_quick_chat_action_internal(opts),
-  })
+  if opts.keys.quick_chat then
+    table.insert(config.keys, {
+      key = opts.keys.quick_chat,
+      mods = "LEADER",
+      action = create_quick_chat_action_internal(opts),
+    })
+  end
 
-  -- Session picker (LEADER + O) - only if sessions enabled
-  if opts.save_sessions then
+  if opts.save_sessions and opts.keys.resume_session then
     table.insert(config.keys, {
       key = opts.keys.resume_session,
       mods = "LEADER|SHIFT",
-      action = create_session_picker_action(opts),
+      action = create_session_picker_action_internal(opts),
     })
   end
 
@@ -453,17 +457,15 @@ end
 -- Utility Exports
 -- ============================================
 
--- Export for manual status bar composition
 M.check_status = function(opts)
-  opts = opts or resolved_opts or defaults
-  return check_server_status(opts)
+  return check_server_status(opts or resolved_opts or defaults)
 end
 
 M.fetch_models = function(opts)
-  opts = opts or resolved_opts or defaults
-  return fetch_models(opts)
+  return fetch_models(opts or resolved_opts or defaults)
 end
 
 M.smart_datetime = smart_datetime
+M.defaults = defaults
 
 return M
