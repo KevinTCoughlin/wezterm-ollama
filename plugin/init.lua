@@ -194,7 +194,7 @@ end
 
 local function check_server_status(opts)
   local now = os.time()
-  if now - state.last_check < 2 then
+  if now - state.last_check < 15 then
     return state.server_status, state.loaded_model
   end
 
