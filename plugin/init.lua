@@ -8,7 +8,7 @@
 --   - Smart datetime display
 
 local wezterm = require("wezterm")
-local utils = require("shared.wezterm_utils")
+local utils = require("lib")
 
 local M = {}
 
