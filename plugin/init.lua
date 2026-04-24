@@ -8,6 +8,7 @@
 --   - Smart datetime display
 
 local wezterm = require("wezterm")
+local utils = require("shared.wezterm_utils")
 
 local M = {}
 
@@ -123,6 +124,9 @@ local function merge_opts(user_opts)
   end
   state.ollama_path = opts.ollama_path
 
+  -- Validate environment and config
+  utils.validate_env()
+  
   return opts
 end
 
@@ -349,16 +353,28 @@ local function create_session_picker_action_internal(opts)
       return
     end
 
-    local handle = io.popen("ls -t " .. opts.sessions_dir .. "/*.json 2>/dev/null | head -20")
+    -- Use safe_run instead of io.popen for secure directory listing
+    local success, output = utils.safe_run({ "find", opts.sessions_dir, "-maxdepth", "1", "-name", "*.json", "-type", "f" })
     local sessions = {}
-    if handle then
-      for line in handle:lines() do
+    
+    if success and output then
+      -- Sort by modification time (newest first)
+      for line in output:gmatch("[^\n]+") do
         local filename = line:match("([^/]+)%.json$")
         if filename then
           table.insert(sessions, { path = line, name = filename })
         end
       end
-      handle:close()
+      
+      -- Sort by filename (reverse)
+      table.sort(sessions, function(a, b) return a.name > b.name end)
+      
+      -- Keep only top 20
+      if #sessions > 20 then
+        for i = 21, #sessions do
+          sessions[i] = nil
+        end
+      end
     end
 
     if #sessions == 0 then
@@ -420,7 +436,9 @@ function M.apply_to_config(config, user_opts)
 
   -- Ensure sessions directory exists if enabled
   if opts.save_sessions then
-    os.execute("mkdir -p " .. opts.sessions_dir)
+    if not utils.mkdir_p(opts.sessions_dir) then
+      wezterm.log_error("Failed to create sessions directory: " .. opts.sessions_dir)
+    end
   end
 
   -- Add keybindings (if not disabled)
