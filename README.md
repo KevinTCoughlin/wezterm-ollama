@@ -1,6 +1,7 @@
 # wezterm-ollama
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/KevinTCoughlin/wezterm-ollama)
+[![CI](https://github.com/KevinTCoughlin/wezterm-ollama/actions/workflows/ci.yml/badge.svg)](https://github.com/KevinTCoughlin/wezterm-ollama/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/tag/KevinTCoughlin/wezterm-ollama)](https://github.com/KevinTCoughlin/wezterm-ollama/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Wezterm plugin for [Ollama](https://ollama.ai) integration with model selection, status bar display, and quick chat.
@@ -11,7 +12,7 @@ Wezterm plugin for [Ollama](https://ollama.ai) integration with model selection,
 - **Status Bar** - Shows Ollama server status and currently loaded model
 - **Quick Chat** - One-key launch of your preferred model
 - **Smart DateTime** - Compact date/time display for status bar
-- **Auto-Detection** - Automatically finds ollama binary path
+- **Auto-Detection** - Automatically finds the Ollama binary
 - **Cross-Platform** - Works on macOS (Intel/Apple Silicon) and Linux
 
 ## Installation
@@ -25,7 +26,7 @@ local ollama = wezterm.plugin.require("https://github.com/KevinTCoughlin/wezterm
 ### Local Development
 
 ```lua
-local ollama = dofile(wezterm.config_dir .. "/plugins/wezterm-ollama/plugin/init.lua")
+local ollama = wezterm.plugin.require("file:///absolute/path/to/wezterm-ollama")
 ```
 
 ## Quick Start
@@ -55,10 +56,10 @@ ollama.apply_to_config(config, {
   default_model = "llama3.2",
 
   -- Caching
-  cache_ttl = 30,  -- Seconds to cache model list
+  cache_ttl = 30,          -- Seconds to cache model list
+  update_interval = 15000, -- Milliseconds between status API checks
 
   -- Features
-  show_status = true,
   save_sessions = false,
   sessions_dir = "~/.ollama/sessions",
 
@@ -80,7 +81,7 @@ ollama.apply_to_config(config, {
   },
 
   -- Status bar icon
-  icon = "🔨",
+  icon = "🦙",
 })
 ```
 
@@ -110,9 +111,9 @@ end)
 
 | Display | Meaning |
 |---------|---------|
-| `🔨 ● llama3.2` | Server running, model loaded |
-| `🔨 ● idle` | Server running, no model loaded |
-| `🔨 ○ off` | Server not running |
+| `🦙 ● llama3.2` | Server running, model loaded |
+| `🦙 ● idle` | Server running, no model loaded |
+| `🦙 ○ off` | Server not running |
 
 ## Custom Keybindings
 
@@ -171,6 +172,10 @@ table.insert(config.keys, {
 - [Ollama](https://ollama.ai) installed and running
 - `curl` for API requests
 
+The API checks are synchronous, bounded to one or two seconds, and cached to
+avoid running a process on every status update. Set `update_interval` higher if
+the Ollama host is remote or slow.
+
 ## Troubleshooting
 
 ### Status shows "off" but Ollama is running
@@ -181,6 +186,9 @@ The plugin uses `127.0.0.1` instead of `localhost` because macOS may resolve `lo
 
 1. Check Ollama is running: `ollama list`
 2. Check API is accessible: `curl http://127.0.0.1:11434/api/tags`
+
+Malformed responses and HTTP errors are treated as unavailable rather than
+raising an error in the WezTerm configuration.
 
 ### Ollama binary not found
 
@@ -196,6 +204,13 @@ ollama.apply_to_config(config, {
 
 MIT
 
+## Releases
+
+User-visible changes are recorded in [CHANGELOG.md](CHANGELOG.md). Release tags
+follow semantic versioning.
+
 ## Contributing
 
-Issues and PRs welcome at [GitHub](https://github.com/KevinTCoughlin/wezterm-ollama).
+Run `make check` before opening a pull request. If WezTerm is installed, run
+`make integration` to load the plugin with its real Lua API. Issues and PRs are
+welcome at [GitHub](https://github.com/KevinTCoughlin/wezterm-ollama).

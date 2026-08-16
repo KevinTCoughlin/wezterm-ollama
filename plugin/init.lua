@@ -1,279 +1,290 @@
--- wezterm-ollama: Ollama integration for Wezterm
+-- wezterm-ollama: Ollama integration for WezTerm
 -- https://github.com/KevinTCoughlin/wezterm-ollama
---
--- Features:
---   - Model selector with InputSelector
---   - Status bar integration (server status, loaded model)
---   - Quick chat keybinding
---   - Smart datetime display
 
 local wezterm = require("wezterm")
--- Get plugin directory for relative requires
-local utils = dofile(os.getenv("HOME") .. "/.config/wezterm/plugins/wezterm-ollama/plugin/lib.lua")
-
 local M = {}
-
--- ============================================
--- Plugin Metadata
--- ============================================
 
 M._VERSION = "1.0.0"
 M._LICENSE = "MIT"
 M._URL = "https://github.com/KevinTCoughlin/wezterm-ollama"
 
--- ============================================
--- Platform Detection & Paths
--- ============================================
-
 local function detect_ollama_path()
-  -- Check common installation paths
   local paths = {
-    "/opt/homebrew/bin/ollama",  -- macOS Homebrew (Apple Silicon)
-    "/usr/local/bin/ollama",     -- macOS Homebrew (Intel) / Linux
-    "/usr/bin/ollama",           -- Linux package manager
+    "/opt/homebrew/bin/ollama",
+    "/usr/local/bin/ollama",
+    "/usr/bin/ollama",
   }
   for _, path in ipairs(paths) do
-    local f = io.open(path, "r")
-    if f then
-      f:close()
+    local file = io.open(path, "r")
+    if file then
+      file:close()
       return path
     end
   end
-  -- Fallback to PATH lookup
   return "ollama"
 end
 
--- ============================================
--- Configuration Defaults
--- ============================================
-
 local defaults = {
-  -- Ollama API settings
   host = "http://127.0.0.1:11434",
-  ollama_path = nil,  -- Auto-detected if nil
-
-  -- Status bar
-  update_interval = 2000,  -- ms between status checks
-  cache_ttl = 30,          -- seconds to cache model list
-
-  -- Default model for quick chat (nil = first available)
+  ollama_path = nil,
+  update_interval = 15000,
+  cache_ttl = 30,
   default_model = nil,
-
-  -- Feature flags
-  show_status = true,
   save_sessions = false,
   sessions_dir = (os.getenv("HOME") or "") .. "/.ollama/sessions",
-
-  -- Keybindings (set to false to disable)
   keys = {
-    select_model = "i",      -- LEADER + key
-    quick_chat = "o",        -- LEADER + key
-    resume_session = "O",    -- LEADER + SHIFT + key
+    select_model = "i",
+    quick_chat = "o",
+    resume_session = "O",
   },
-
-  -- Status bar colors (Tokyo Night defaults)
   colors = {
-    running = "#9ece6a",     -- Green
-    stopped = "#f7768e",     -- Red
-    model = "#7aa2f7",       -- Blue
-    loading = "#e0af68",     -- Orange
-    separator = "#565f89",   -- Gray
-    datetime = "#565f89",    -- Gray
+    running = "#9ece6a",
+    stopped = "#f7768e",
+    model = "#7aa2f7",
+    loading = "#e0af68",
+    separator = "#565f89",
+    datetime = "#565f89",
   },
-
-  -- Status bar icon
   icon = "🦙",
 }
-
--- ============================================
--- State Management
--- ============================================
 
 local state = {
   models = {},
   models_updated = 0,
+  models_host = nil,
   server_status = "unknown",
   loaded_model = nil,
   last_check = 0,
-  ollama_path = nil,
+  status_host = nil,
 }
 
--- Deep merge user options with defaults
-local function merge_opts(user_opts)
-  user_opts = user_opts or {}
-  local opts = {}
+local function copy_table(value)
+  local result = {}
+  for key, item in pairs(value) do
+    result[key] = type(item) == "table" and copy_table(item) or item
+  end
+  return result
+end
 
-  for k, v in pairs(defaults) do
-    if type(v) == "table" then
-      opts[k] = {}
-      for tk, tv in pairs(v) do
-        opts[k][tk] = tv
-      end
-      if user_opts[k] and type(user_opts[k]) == "table" then
-        for tk, tv in pairs(user_opts[k]) do
-          opts[k][tk] = tv
-        end
+local function normalize_host(host)
+  if type(host) ~= "string" or host == "" then
+    error("wezterm-ollama: host must be a non-empty HTTP(S) URL")
+  end
+  if not host:match("^https?://") then
+    error("wezterm-ollama: host must use http:// or https://")
+  end
+  return host:gsub("/+$", "")
+end
+
+local function expand_home(path)
+  if path == "~" or path:sub(1, 2) == "~/" then
+    local home = os.getenv("HOME")
+    if not home or home == "" then
+      error("wezterm-ollama: HOME must be set to expand sessions_dir")
+    end
+    return home .. path:sub(2)
+  end
+  return path
+end
+
+local function resolve_opts(user_opts)
+  if user_opts ~= nil and type(user_opts) ~= "table" then
+    error("wezterm-ollama: options must be a table")
+  end
+
+  local opts = copy_table(defaults)
+  for key, value in pairs(user_opts or {}) do
+    if type(opts[key]) == "table" and type(value) == "table" then
+      for nested_key, nested_value in pairs(value) do
+        opts[key][nested_key] = nested_value
       end
     else
-      opts[k] = user_opts[k] ~= nil and user_opts[k] or v
+      opts[key] = value
     end
   end
 
-  -- Auto-detect ollama path if not specified
-  if not opts.ollama_path then
-    opts.ollama_path = detect_ollama_path()
-  end
-  state.ollama_path = opts.ollama_path
+  opts.host = normalize_host(opts.host)
+  opts.ollama_path = opts.ollama_path or detect_ollama_path()
+  opts.sessions_dir = expand_home(opts.sessions_dir)
 
-  -- Validate environment and config
-  utils.validate_env()
-  
+  if type(opts.ollama_path) ~= "string" or opts.ollama_path == "" then
+    error("wezterm-ollama: ollama_path must be a non-empty string")
+  end
+  if type(opts.cache_ttl) ~= "number" or opts.cache_ttl < 0 then
+    error("wezterm-ollama: cache_ttl must be a non-negative number")
+  end
+  if type(opts.update_interval) ~= "number" or opts.update_interval < 0 then
+    error("wezterm-ollama: update_interval must be a non-negative number")
+  end
+  if type(opts.keys) ~= "table" or type(opts.colors) ~= "table" then
+    error("wezterm-ollama: keys and colors must be tables")
+  end
+  if type(opts.sessions_dir) ~= "string" or opts.sessions_dir == ""
+      or opts.sessions_dir:sub(1, 1) == "-" then
+    error("wezterm-ollama: sessions_dir must be a non-empty path")
+  end
+
   return opts
 end
 
--- Resolved options (set after apply_to_config)
 local resolved_opts = nil
 
--- ============================================
--- JSON Parsing Helpers
--- ============================================
+local function safe_json_parse(output)
+  if type(output) ~= "string" or output == "" then
+    return nil
+  end
+  local ok, result = pcall(wezterm.json_parse, output)
+  if not ok or type(result) ~= "table" then
+    wezterm.log_error("wezterm-ollama: invalid JSON returned by Ollama")
+    return nil
+  end
+  return result
+end
 
-local function parse_model_info(str)
+local function request_json(opts, path, timeout_seconds)
+  local success, output, stderr = wezterm.run_child_process({
+    "curl",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--connect-timeout",
+    tostring(timeout_seconds),
+    "--max-time",
+    tostring(timeout_seconds),
+    "--",
+    opts.host .. path,
+  })
+
+  if not success then
+    if stderr and stderr ~= "" then
+      wezterm.log_error("wezterm-ollama: Ollama request failed: " .. stderr:gsub("%s+$", ""))
+    end
+    return nil
+  end
+  return safe_json_parse(output)
+end
+
+local function parse_model_info(response)
+  if type(response.models) ~= "table" then
+    return nil
+  end
+
   local models = {}
   local seen = {}
-
-  for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
-    if not seen[name] then
-      seen[name] = true
-      local escaped = name:gsub("([%.%-%+%:])", "%%%1")
-      local size = str:match('"name"%s*:%s*"' .. escaped .. '".-"size"%s*:%s*(%d+)')
-      local params = str:match('"name"%s*:%s*"' .. escaped .. '".-"parameter_size"%s*:%s*"([^"]+)"')
-      table.insert(models, {
-        name = name,
-        size = size and tonumber(size) or 0,
-        params = params or "",
-      })
+  for _, model in ipairs(response.models) do
+    if type(model) == "table" then
+      local name = model.name or model.model
+      if type(name) == "string" and name ~= "" and not seen[name] then
+        seen[name] = true
+        local details = type(model.details) == "table" and model.details or {}
+        table.insert(models, {
+          name = name,
+          size = type(model.size) == "number" and model.size or 0,
+          params = type(details.parameter_size) == "string" and details.parameter_size or "",
+        })
+      end
     end
   end
   return models
 end
 
-local function parse_running_models(str)
+local function parse_running_models(response)
+  if type(response.models) ~= "table" then
+    return nil
+  end
+
   local models = {}
   local seen = {}
-
-  for name in str:gmatch('"name"%s*:%s*"([^"]+)"') do
-    if not seen[name] then
-      seen[name] = true
-      table.insert(models, name)
+  for _, model in ipairs(response.models) do
+    if type(model) == "table" then
+      local name = model.name or model.model
+      if type(name) == "string" and name ~= "" and not seen[name] then
+        seen[name] = true
+        table.insert(models, name)
+      end
     end
   end
   return models
 end
-
--- ============================================
--- Ollama API
--- ============================================
 
 local function fetch_models(opts)
   local now = os.time()
-  if now - state.models_updated < opts.cache_ttl and #state.models > 0 then
+  if state.models_host == opts.host
+      and now - state.models_updated < opts.cache_ttl
+      and #state.models > 0 then
     return state.models
   end
 
-  local success, output = wezterm.run_child_process({
-    "curl", "-s", "--connect-timeout", "2",
-    opts.host .. "/api/tags",
-  })
-
-  if success and output and output ~= "" then
-    state.models = parse_model_info(output)
-    state.models_updated = now
-    state.server_status = "running"
-  else
-    state.server_status = "stopped"
+  local response = request_json(opts, "/api/tags", 2)
+  local models = response and parse_model_info(response) or nil
+  if not models then
+    return {}
   end
-
+  state.models = models
+  state.models_updated = now
+  state.models_host = opts.host
   return state.models
 end
 
 local function check_server_status(opts)
   local now = os.time()
-  if now - state.last_check < 15 then
+  local interval_seconds = math.max(1, math.ceil(opts.update_interval / 1000))
+  if state.status_host == opts.host and now - state.last_check < interval_seconds then
     return state.server_status, state.loaded_model
   end
 
-  local success, output = wezterm.run_child_process({
-    "curl", "-s", "--connect-timeout", "1",
-    opts.host .. "/api/ps",
-  })
-
+  local response = request_json(opts, "/api/ps", 1)
+  local running = response and parse_running_models(response) or nil
   state.last_check = now
+  state.status_host = opts.host
 
-  if not success or not output or output == "" then
+  if not running then
     state.server_status = "stopped"
     state.loaded_model = nil
-    return state.server_status, state.loaded_model
+  else
+    state.server_status = "running"
+    state.loaded_model = running[1]
   end
-
-  state.server_status = "running"
-  local running = parse_running_models(output)
-  state.loaded_model = running[1]
-
   return state.server_status, state.loaded_model
 end
-
--- ============================================
--- Smart Date/Time Formatter
--- ============================================
 
 local function smart_datetime()
   local date = os.date("*t")
   local hour = date.hour % 12
-  if hour == 0 then hour = 12 end
+  if hour == 0 then
+    hour = 12
+  end
   local ampm = date.hour < 12 and "a" or "p"
   local weekdays = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
   return string.format("%s %d:%02d%s", weekdays[date.wday], hour, date.min, ampm)
 end
 
--- ============================================
--- Status Bar Elements
--- ============================================
-
-function M.get_status_elements(opts)
-  opts = opts or resolved_opts or defaults
+function M.get_status_elements(user_opts)
+  local opts = user_opts and resolve_opts(user_opts) or resolved_opts or resolve_opts()
   local elements = {}
   local status, model = check_server_status(opts)
 
-  -- Icon
   table.insert(elements, { Foreground = { Color = opts.colors.model } })
   table.insert(elements, { Text = opts.icon .. " " })
-
   if status == "running" then
     table.insert(elements, { Foreground = { Color = opts.colors.running } })
     table.insert(elements, { Text = "● " })
-
     if model then
-      local display_name = model:match("^([^:]+)") or model
       table.insert(elements, { Foreground = { Color = opts.colors.model } })
-      table.insert(elements, { Text = display_name })
+      table.insert(elements, { Text = model:match("^([^:]+)") or model })
     else
       table.insert(elements, { Foreground = { Color = opts.colors.separator } })
       table.insert(elements, { Text = "idle" })
     end
-  elseif status == "loading" then
-    table.insert(elements, { Foreground = { Color = opts.colors.loading } })
-    table.insert(elements, { Text = "◐ loading" })
   else
     table.insert(elements, { Foreground = { Color = opts.colors.stopped } })
     table.insert(elements, { Text = "○ off" })
   end
-
   return elements
 end
 
-function M.get_datetime_elements(opts)
-  opts = opts or resolved_opts or defaults
+function M.get_datetime_elements(user_opts)
+  local opts = user_opts and resolve_opts(user_opts) or resolved_opts or resolve_opts()
   return {
     { Foreground = { Color = opts.colors.separator } },
     { Text = "  │  " },
@@ -282,21 +293,20 @@ function M.get_datetime_elements(opts)
   }
 end
 
--- ============================================
--- Actions
--- ============================================
-
 local function format_size(bytes)
-  if not bytes or bytes == 0 then return "" end
+  if not bytes or bytes == 0 then
+    return ""
+  end
   local gb = bytes / (1024 * 1024 * 1024)
-  if gb >= 1 then return string.format("%.1fGB", gb) end
+  if gb >= 1 then
+    return string.format("%.1fGB", gb)
+  end
   return string.format("%.0fMB", bytes / (1024 * 1024))
 end
 
 local function create_model_selector_action_internal(opts)
   return wezterm.action_callback(function(window, pane)
     local models = fetch_models(opts)
-
     if #models == 0 then
       window:toast_notification("Ollama", "No models found. Is Ollama running?", nil, 3000)
       return
@@ -306,45 +316,51 @@ local function create_model_selector_action_internal(opts)
     for _, model in ipairs(models) do
       local label = model.name
       local details = {}
-      if model.params ~= "" then table.insert(details, model.params) end
-      if model.size > 0 then table.insert(details, format_size(model.size)) end
-      if #details > 0 then label = label .. " (" .. table.concat(details, ", ") .. ")" end
+      if model.params ~= "" then
+        table.insert(details, model.params)
+      end
+      if model.size > 0 then
+        table.insert(details, format_size(model.size))
+      end
+      if #details > 0 then
+        label = label .. " (" .. table.concat(details, ", ") .. ")"
+      end
       table.insert(choices, { id = model.name, label = label })
     end
 
-    window:perform_action(
-      wezterm.action.InputSelector({
-        title = opts.icon .. " Select Ollama Model",
-        description = "Choose a model to run",
-        choices = choices,
-        fuzzy = true,
-        action = wezterm.action_callback(function(inner_window, inner_pane, id)
-          if id then
-            inner_window:perform_action(
-              wezterm.action.SpawnCommandInNewTab({
-                args = { opts.ollama_path, "run", id },
-                set_environment_variables = { OLLAMA_MODEL = id },
-              }),
-              inner_pane
-            )
-          end
-        end),
-      }),
-      pane
-    )
+    window:perform_action(wezterm.action.InputSelector({
+      title = opts.icon .. " Select Ollama Model",
+      description = "Choose a model to run",
+      choices = choices,
+      fuzzy = true,
+      action = wezterm.action_callback(function(inner_window, inner_pane, id)
+        if id then
+          inner_window:perform_action(wezterm.action.SpawnCommandInNewTab({
+            args = { opts.ollama_path, "run", id },
+            set_environment_variables = { OLLAMA_MODEL = id },
+          }), inner_pane)
+        end
+      end),
+    }), pane)
   end)
 end
 
 local function create_quick_chat_action_internal(opts)
-  -- If no default model, use model selector instead
   if not opts.default_model then
     return create_model_selector_action_internal(opts)
   end
-
   return wezterm.action.SpawnCommandInNewTab({
     args = { opts.ollama_path, "run", opts.default_model },
     set_environment_variables = { OLLAMA_MODEL = opts.default_model },
   })
+end
+
+local function mkdir_p(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+  local success = wezterm.run_child_process({ "mkdir", "-p", "--", path })
+  return success
 end
 
 local function create_session_picker_action_internal(opts)
@@ -354,27 +370,22 @@ local function create_session_picker_action_internal(opts)
       return
     end
 
-    -- Use safe_run instead of io.popen for secure directory listing
-    local success, output = utils.safe_run({ "find", opts.sessions_dir, "-maxdepth", "1", "-name", "*.json", "-type", "f" })
+    local success, output = wezterm.run_child_process({
+      "find", opts.sessions_dir, "-maxdepth", "1", "-name", "*.json", "-type", "f",
+    })
     local sessions = {}
-    
     if success and output then
-      -- Sort by modification time (newest first)
       for line in output:gmatch("[^\n]+") do
         local filename = line:match("([^/]+)%.json$")
         if filename then
           table.insert(sessions, { path = line, name = filename })
         end
       end
-      
-      -- Sort by filename (reverse)
-      table.sort(sessions, function(a, b) return a.name > b.name end)
-      
-      -- Keep only top 20
-      if #sessions > 20 then
-        for i = 21, #sessions do
-          sessions[i] = nil
-        end
+      table.sort(sessions, function(a, b)
+        return a.name > b.name
+      end)
+      while #sessions > 20 do
+        table.remove(sessions)
       end
     end
 
@@ -387,64 +398,48 @@ local function create_session_picker_action_internal(opts)
     for _, session in ipairs(sessions) do
       table.insert(choices, { id = session.path, label = session.name })
     end
-
-    window:perform_action(
-      wezterm.action.InputSelector({
-        title = opts.icon .. " Resume Ollama Session",
-        description = "Choose a session to resume",
-        choices = choices,
-        fuzzy = true,
-        action = wezterm.action_callback(function(inner_window, inner_pane, id, label)
-          if id then
-            local model = label:match("^([^_]+)")
-            if model then
-              inner_window:perform_action(
-                wezterm.action.SpawnCommandInNewTab({
-                  args = { opts.ollama_path, "run", model },
-                  set_environment_variables = { OLLAMA_MODEL = model },
-                }),
-                inner_pane
-              )
-            end
-          end
-        end),
-      }),
-      pane
-    )
+    window:perform_action(wezterm.action.InputSelector({
+      title = opts.icon .. " Resume Ollama Session",
+      description = "Choose a session to resume",
+      choices = choices,
+      fuzzy = true,
+      action = wezterm.action_callback(function(inner_window, inner_pane, _, label)
+        local model = label and label:match("^([^_]+)")
+        if model then
+          inner_window:perform_action(wezterm.action.SpawnCommandInNewTab({
+            args = { opts.ollama_path, "run", model },
+            set_environment_variables = { OLLAMA_MODEL = model },
+          }), inner_pane)
+        end
+      end),
+    }), pane)
   end)
 end
 
--- Public action creators (for custom keybindings)
-function M.create_model_selector_action(opts)
-  return create_model_selector_action_internal(opts or resolved_opts or defaults)
+function M.create_model_selector_action(user_opts)
+  return create_model_selector_action_internal(resolve_opts(user_opts or resolved_opts))
 end
 
-function M.create_quick_chat_action(opts)
-  return create_quick_chat_action_internal(opts or resolved_opts or defaults)
+function M.create_quick_chat_action(user_opts)
+  return create_quick_chat_action_internal(resolve_opts(user_opts or resolved_opts))
 end
 
-function M.create_session_picker_action(opts)
-  return create_session_picker_action_internal(opts or resolved_opts or defaults)
+function M.create_session_picker_action(user_opts)
+  return create_session_picker_action_internal(resolve_opts(user_opts or resolved_opts))
 end
-
--- ============================================
--- Main Entry Point
--- ============================================
 
 function M.apply_to_config(config, user_opts)
-  local opts = merge_opts(user_opts)
+  if type(config) ~= "table" and type(config) ~= "userdata" then
+    error("wezterm-ollama: config must be a config builder")
+  end
+  local opts = resolve_opts(user_opts)
   resolved_opts = opts
 
-  -- Ensure sessions directory exists if enabled
-  if opts.save_sessions then
-    if not utils.mkdir_p(opts.sessions_dir) then
-      wezterm.log_error("Failed to create sessions directory: " .. opts.sessions_dir)
-    end
+  if opts.save_sessions and not mkdir_p(opts.sessions_dir) then
+    wezterm.log_error("wezterm-ollama: failed to create sessions directory: " .. opts.sessions_dir)
   end
 
-  -- Add keybindings (if not disabled)
   config.keys = config.keys or {}
-
   if opts.keys.select_model then
     table.insert(config.keys, {
       key = opts.keys.select_model,
@@ -452,7 +447,6 @@ function M.apply_to_config(config, user_opts)
       action = create_model_selector_action_internal(opts),
     })
   end
-
   if opts.keys.quick_chat then
     table.insert(config.keys, {
       key = opts.keys.quick_chat,
@@ -460,7 +454,6 @@ function M.apply_to_config(config, user_opts)
       action = create_quick_chat_action_internal(opts),
     })
   end
-
   if opts.save_sessions and opts.keys.resume_session then
     table.insert(config.keys, {
       key = opts.keys.resume_session,
@@ -468,23 +461,18 @@ function M.apply_to_config(config, user_opts)
       action = create_session_picker_action_internal(opts),
     })
   end
-
   return opts
 end
 
--- ============================================
--- Utility Exports
--- ============================================
-
-M.check_status = function(opts)
-  return check_server_status(opts or resolved_opts or defaults)
+function M.check_status(user_opts)
+  return check_server_status(resolve_opts(user_opts or resolved_opts))
 end
 
-M.fetch_models = function(opts)
-  return fetch_models(opts or resolved_opts or defaults)
+function M.fetch_models(user_opts)
+  return fetch_models(resolve_opts(user_opts or resolved_opts))
 end
 
 M.smart_datetime = smart_datetime
-M.defaults = defaults
+M.defaults = copy_table(defaults)
 
 return M
